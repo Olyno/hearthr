@@ -1,0 +1,16 @@
+[package]
+name = "hearthr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Register a named background process with the OS service manager: systemd user units, launchd LaunchAgents, Windows Task Scheduler — one spec in, a kept-alive daemon out."
+license = "Apache-2.0"
+keywords = ["service", "daemon", "systemd", "launchd", "schtasks"]
+categories = ["os", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
