@@ -4,6 +4,14 @@
 //! goes in; the OS owns the process from there — at login, across crashes,
 //! after the installing app is gone.
 //!
+//! Start at [`Service`] / [`ServiceBuilder`] for the ergonomic road:
+//! one name in, the three platform identifiers derived, lifecycle
+//! verbs on a handle. [`ServiceSpec`] remains the canonical explicit
+//! contract every adapter consumes, and the free functions
+//! ([`install`], [`uninstall`], [`set_running`], [`sync_launch_env`],
+//! [`probe`]) are its direct verbs — the high-level handle forwards to
+//! exactly those.
+//!
 //! The crate is deliberately **mechanism, not policy**:
 //!
 //! - It generates the artifact each OS demands and drives the platform's
@@ -69,6 +77,7 @@ mod io;
 pub mod launchd;
 mod orchestration;
 mod runner;
+pub mod service;
 mod spec;
 pub mod systemd;
 pub mod windows;
@@ -77,4 +86,5 @@ pub use orchestration::{
     install, installed, probe, read_spec, set_running, sync_launch_env, uninstall,
 };
 pub use runner::{detect, detect_os, OsServiceRunner};
+pub use service::{IntoEnvPairs, Service, ServiceBuilder};
 pub use spec::{Command, ServiceFile, ServiceSpec, ServiceState, UnitId};

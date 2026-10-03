@@ -74,9 +74,7 @@ pub fn detect_os(
         "macos" if on_path("launchctl") => {
             Some(Box::new(crate::launchd::LaunchAgentRunner::default()))
         }
-        "windows" if on_path("schtasks") => {
-            Some(Box::new(crate::windows::WindowsTaskRunner))
-        }
+        "windows" if on_path("schtasks") => Some(Box::new(crate::windows::WindowsTaskRunner)),
         _ => None,
     }
 }

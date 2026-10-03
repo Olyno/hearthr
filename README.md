@@ -5,11 +5,44 @@ operating system's own service manager — a **systemd user unit** on
 Linux, a **launchd LaunchAgent** on macOS, a **Task Scheduler task** on
 Windows — and drive it through the platform's native control tool.
 
-One `ServiceSpec` goes in; the OS owns the process from there: at login,
-across crashes, after the installing application is gone.
+## Quickstart — one name, one sentence
 
 ```rust
-use hearthr::{install, ServiceSpec, UnitId};
+use hearthr::Service;
+use std::time::Duration;
+
+// The three OS identifiers are derived from the single name; the data
+// dir lands in the platform's conventional home (XDG / Application
+// Support / %APPDATA%). The launch environment arrives as pairs at the
+// call site — the crate never stores a secret.
+let (door, state) = Service::define("mydoor")
+    .program("/home/me/.local/bin/mydoor")
+    .args(["--port", "8765"])
+    .install(vec![("MYDOOR_TOKEN".to_string(), "s3cr3t".to_string())])?;
+
+assert!(state.installed);
+door.wait_for_running(Duration::from_secs(10)); // green dot is real
+door.sync_env(vec![("MYDOOR_TOKEN".to_string(), "rotated".to_string())], true)?;
+door.stop()?;
+door.uninstall()?; // every trace of the secret goes with it
+# Ok::<(), String>(())
+```
+
+Need exact control over what the OS registers? Every derivation is
+overridable — `.systemd_unit("my-endpoint")`, `.job_label("com.example.endpoint")`,
+`.task_name("My Endpoint")`, `.reverse_domain("com.example")`,
+`.data_dir(...)`, `.env_file(...)`, `.windows_env_drop(["TOKEN"])`. And
+`Service::spec()` hands back the plain `ServiceSpec` for the low-level
+functions below.
+
+## The low road: explicit everything
+
+The high-level `Service` is the ergonomic roof; the explicit contract
+remains canonical. A `ServiceSpec` spells all three platform names, the
+program, and the paths, and the free functions drive it:
+
+```rust
+use hearthr::{install, uninstall, ServiceSpec, UnitId};
 
 let spec = ServiceSpec {
     id: UnitId {
@@ -26,17 +59,19 @@ let spec = ServiceSpec {
     env_file: "/home/me/.local/share/mydoor/launch.env".into(),
     data_dir: "/home/me/.local/share/mydoor".into(),
 };
-
-// The pairs are the service's launch environment, from wherever the
-// caller keeps secrets.
 let env = vec![("MYDOOR_TOKEN".to_string(), "s3cr3t".to_string())];
 let state = install(&spec, &env)?; // probes back: kind, unit, installed, running
 ```
 
-Lifecycle: `install`, `uninstall`, `set_running`, `sync_launch_env` (re-render
-the environment and bounce only if up and allowed), `probe`, `installed`,
-`detect` (adapter for this machine, `None` on machines without a runner —
-the caller keeps supervising its child, the default posture).
+Lifecycle verbs: `install`, `uninstall`, `set_running`,
+`sync_launch_env` (re-render the environment and bounce only if up and
+allowed), `probe`, `installed`, `detect` (adapter for this machine,
+`None` on machines without a runner — the caller keeps supervising its
+child, the default posture).
+
+`Service::load(data_dir)` rehydrates a handle from the spec file a
+previous install left behind — a second command of the same app drives
+the service the first one installed without carrying the spec around.
 
 ## What this crate deliberately is not
 
@@ -65,11 +100,11 @@ the caller keeps supervising its child, the default posture).
 
 ## Tests and CI
 
-`cargo test` runs 22 unit tests (unit/plist/wrapper content grammar,
-quoting survival, lifecycle ordering through an injected recorder,
-detection branches per named OS, file modes on unix). CI gates
-`fmt --check`, `clippy -D warnings`, and `test` on ubuntu + macOS +
-windows.
+`cargo test` runs 30 unit tests plus 2 doc examples (builder name
+derivation and overrides, unit/plist/wrapper content grammar, quoting
+survival, lifecycle ordering through an injected recorder, detection
+branches per named OS, file modes on unix). CI gates `fmt --check`,
+`clippy -D warnings`, and `test` on ubuntu + macOS + windows.
 
 ## Provenance
 
