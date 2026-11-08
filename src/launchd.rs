@@ -1,9 +1,11 @@
 //! macOS: a launchd LaunchAgent under `~/Library/LaunchAgents/`, driven
 //! by `launchctl bootstrap`/`bootout`. `RunAtLoad` starts the process at
-//! login; `KeepAlive` stays false on purpose — launchd's throttle
-//! (`ThrottleInterval`) already bounds how fast a crash loop can spin,
-//! and the caller's retry ladder plus its Start affordance are the
-//! relaunchers this design answers to.
+//! login and `KeepAlive` brings it back after a crash: the crate's
+//! keep-alive law names launchd as the relauncher, and `ThrottleInterval`
+//! is what bounds the loop — a crash loop may not spin faster than one
+//! respawn every ten seconds. Stop therefore answers with a `bootout`,
+//! not a kill: a KeepAlive job that is merely killed is respawned, so a
+//! stopped job is an unloaded job.
 //!
 //! The launch environment rides the plist's `EnvironmentVariables` dict,
 //! and the plist is written `0600`: the trust boundary is the owner's own
@@ -124,28 +126,40 @@ impl OsServiceRunner for LaunchAgentRunner {
     }
 
     fn start_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
-        // kickstart starts a loaded-but-stopped job and bounces a running
-        // one; both readings of "Start" from the app are correct answers.
-        vec![Command::new(
-            "launchctl",
-            vec!["kickstart".into(), self.job(spec)],
-        )]
+        // A stop bootout can leave the label flagged disabled, and a
+        // disabled label kickstarts to nothing. enable is strict here for
+        // the same reason install_cmds treats it strictly: the start was
+        // not delivered if the label cannot run. kickstart then starts
+        // the loaded job (KeepAlive, not RunAtLoad, is what keeps it up).
+        vec![
+            Command::new("launchctl", vec!["enable".into(), self.job(spec)]),
+            Command::new("launchctl", vec!["kickstart".into(), self.job(spec)]),
+        ]
     }
 
     fn stop_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
-        // kill(SIGTERM) stops the process, and KeepAlive false says
-        // launchd must not bring it back. The job stays loaded so the
-        // Start affordance can kickstart it without a re-bootstrap.
-        vec![Command::new(
-            "launchctl",
-            vec!["kill".into(), "SIGTERM".into(), self.job(spec)],
-        )]
+        // The graceful ask first, then the unload: a KeepAlive job that
+        // is only killed is answered with a respawn, so the stop is not
+        // real until the job is booted out. Both lenient: a graceful
+        // service that exited on the SIGTERM before bootout ran, and a
+        // bootout of an already-booted-out job, are clean slates, not
+        // failures.
+        vec![
+            Command::lenient(
+                "launchctl",
+                vec!["kill".into(), "SIGTERM".into(), self.job(spec)],
+            ),
+            Command::lenient("launchctl", vec!["bootout".into(), self.job(spec)]),
+        ]
     }
 
     fn restart_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
-        // The plist IS the environment: replace the job with itself.
+        // The plist IS the environment: replace the job with itself,
+        // enable included — bootout can leave the label disabled, and a
+        // disabled bootstrap would start nothing.
         vec![
             Command::lenient("launchctl", vec!["bootout".into(), self.job(spec)]),
+            Command::new("launchctl", vec!["enable".into(), self.job(spec)]),
             Command::new(
                 "launchctl",
                 vec![
@@ -173,10 +187,11 @@ impl OsServiceRunner for LaunchAgentRunner {
 /// The LaunchAgent plist: label, the service's own argv (no shell string
 /// — each argument is one `<string>` node, XML-escaped only), the launch
 /// environment in the `EnvironmentVariables` dict of this `0600` file,
-/// run-at-login without keep-alive, and a throttle so a crash loop at
-/// boot cannot spin the CPU. stderr goes to a log file in the data dir:
-/// a daemon nobody reads from must still tell someone why it died, and
-/// launchd has no terminal to tell them in.
+/// run-at-login plus keep-alive, and a throttle so the crash-restart
+/// respawn cannot spin the CPU — a crash loop runs at most one restart
+/// every `ThrottleInterval` seconds. stderr goes to a log file in the
+/// data dir: a daemon nobody reads from must still tell someone why it
+/// died, and launchd has no terminal to tell them in.
 fn plist_file(spec: &ServiceSpec, env: &[(String, String)]) -> String {
     let args = spec
         .unix_exec()
@@ -213,7 +228,7 @@ fn plist_file(spec: &ServiceSpec, env: &[(String, String)]) -> String {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardErrorPath</key>
@@ -294,8 +309,8 @@ mod tests {
         );
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(
-            plist.contains("<key>KeepAlive</key>\n    <false/>"),
-            "no unthrottled respawn"
+            plist.contains("<key>KeepAlive</key>\n    <true/>"),
+            "a crash restarts: the throttle, not the absence of keep-alive, bounds the loop"
         );
         assert!(
             plist.contains("--no-keystore"),
@@ -323,16 +338,72 @@ mod tests {
         );
         assert_eq!(install[2].args[0], "bootstrap");
         assert_eq!(install[2].args[1], "gui/501");
-        // Stop is a kill, not a bootout: the job stays loaded for Start.
+        // Stop unloads: a killed KeepAlive job comes back, a booted-out
+        // one does not.
+        let stop = runner.stop_cmds(&s);
         assert_eq!(
-            runner.stop_cmds(&s)[0].args,
+            stop[0].args,
             vec!["kill", "SIGTERM", "gui/501/com.example.mydoor"]
         );
+        assert_eq!(stop[1].args, vec!["bootout", "gui/501/com.example.mydoor"]);
         // Restart replaces the job — the plist IS the environment.
         let restart = runner.restart_cmds(&s);
-        assert_eq!(restart.len(), 2);
+        assert_eq!(restart.len(), 3);
         assert_eq!(restart[0].args[0], "bootout");
-        assert_eq!(restart[1].args[0], "bootstrap");
+        assert_eq!(restart[1].args[0], "enable");
+        assert_eq!(restart[2].args[0], "bootstrap");
+    }
+
+    #[test]
+    fn the_plist_keeps_a_crashed_job_alive() {
+        let runner = LaunchAgentRunner::at("/Users/me", 501);
+        let files = runner.install_files(&spec(Path::new("/Users/me")), &[]);
+        let plist = &files[0].contents;
+        assert!(
+            plist.contains("<key>KeepAlive</key>\n    <true/>"),
+            "the keep-alive law names launchd as the relauncher"
+        );
+        assert!(plist.contains("<key>ThrottleInterval</key>\n    <integer>10</integer>"));
+    }
+
+    #[test]
+    fn stop_unloads_and_start_re_enables() {
+        let runner = LaunchAgentRunner::at("/Users/me", 501);
+        let s = spec(Path::new("/Users/me"));
+        let stop = runner.stop_cmds(&s);
+        assert_eq!(stop.len(), 2);
+        assert_eq!(
+            stop[0].args,
+            vec!["kill", "SIGTERM", "gui/501/com.example.mydoor"]
+        );
+        assert!(
+            stop[0].lenient,
+            "a job that died on the SIGTERM is stopped already"
+        );
+        assert_eq!(stop[1].args, vec!["bootout", "gui/501/com.example.mydoor"]);
+        assert!(
+            stop[1].lenient,
+            "booting out a stopped job is the clean slate"
+        );
+        let start = runner.start_cmds(&s);
+        assert_eq!(start.len(), 2);
+        assert_eq!(start[0].args, vec!["enable", "gui/501/com.example.mydoor"]);
+        assert!(
+            !start[0].lenient,
+            "a label that cannot run means the start was not delivered"
+        );
+        assert_eq!(
+            start[1].args,
+            vec!["kickstart", "gui/501/com.example.mydoor"]
+        );
+        assert!(!start[1].lenient);
+        let restart = runner.restart_cmds(&s);
+        assert!(
+            restart[0].lenient,
+            "bootout of a gone job is the clean slate"
+        );
+        assert!(!restart[1].lenient);
+        assert!(!restart[2].lenient);
     }
 
     #[test]
