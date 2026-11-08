@@ -100,9 +100,10 @@ the service the first one installed without carrying the spec around.
 
 ## Tests and CI
 
-`cargo test` runs 30 unit tests plus 2 doc examples (builder name
+`cargo test` runs 44 unit tests plus 2 doc examples (builder name
 derivation and overrides, unit/plist/wrapper content grammar, quoting
-survival, lifecycle ordering through an injected recorder, detection
+survival, preflight rejection of what a platform grammar cannot carry,
+lifecycle ordering through an injected recorder, detection
 branches per named OS, file modes on unix). CI gates `fmt --check`,
 `clippy -D warnings`, and `test` on ubuntu + macOS + windows.
 
