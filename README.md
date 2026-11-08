@@ -73,6 +73,28 @@ child, the default posture).
 previous install left behind — a second command of the same app drives
 the service the first one installed without carrying the spec around.
 
+### The spec, field by field
+
+| field | what it is |
+| --- | --- |
+| `id` | the names the three OS runners know this service by: `id.systemd` (unit file name, `mydoor.service`), `id.launchd` (reverse-DNS job label, `com.example.mydoor`), `id.windows` (free-text Task Scheduler name, `My Door`). Each platform spells identifiers in its own grammar; none of them may drift — a service registered under one name must not answer under another. |
+| `display_name` | the human one-liner the unit carries as its description (`Description=` in the systemd unit). |
+| `binary` | the program to run, **absolute path required**: the OS manager's cwd is nobody's app directory, and the path must resolve after the installing app is gone (a published location, never a build dir). |
+| `args` | the common command line: `binary + args` on every platform. |
+| `unix_args` | extra argv appended **only** on systemd/launchd — flags whose meaning relies on the launch env being a file/dict the unit re-reads. Never reach the Windows wrapper. |
+| `windows_args` | extra argv appended **only** in the task wrapper — Windows-only flags (a tray flag). Never reach the unix units. |
+| `windows_env_drop` | env **names** excluded from the Windows wrapper only (they still land in the env file and the other adapters). cmd's `set "K=V"` grammar cannot promise some values verbatim; since 0.1 an unsafe value fails the install at preflight instead, so this list is the opt-out for names you know are unsafe or unneeded on Windows. |
+| `env_file` | the 0600 `launch.env` holding the launch environment as `KEY="value"` lines. On systemd the unit references it via `EnvironmentFile=` and re-reads it at every start (that's why the unit itself stays secret-free and world-readable); on every platform it is written, because it is the caller's re-render source of truth for `sync_launch_env` and repair. Uninstall removes it. |
+| `data_dir` | the per-service home the install owns: the spec file (`hearthr-service.json`, what `Service::load` rehydrates), the Windows artifacts (wrapper `.cmd`, task `.xml` — the scheduler keeps no readable copy), and the stderr log the launchd/Windows artifacts point into. Uninstall removes everything it wrote there. |
+
+The final command line is `binary + args + unix_args` on unix and
+`binary + args + windows_args` on Windows. Secrets never ride argv —
+they ride `env_file`. Not spelled out in the spec: the launch
+environment itself (never stored by the crate, arriving as pairs at
+every install/sync), and the restart policy (fixed law per adapter:
+`Restart=on-failure` + rate ceiling, `KeepAlive` +
+`ThrottleInterval`, `RestartOnFailure` — not a knob).
+
 ## What this crate deliberately is not
 
 - **Not a secret store.** The launch environment arrives as a pair list.
@@ -100,7 +122,7 @@ the service the first one installed without carrying the spec around.
 
 ## Tests and CI
 
-`cargo test` runs 44 unit tests plus 2 doc examples (builder name
+`cargo test` runs 42 unit tests plus 2 doc examples (builder name
 derivation and overrides, unit/plist/wrapper content grammar, quoting
 survival, preflight rejection of what a platform grammar cannot carry,
 lifecycle ordering through an injected recorder, detection
