@@ -139,7 +139,16 @@ pub(crate) fn install_with(
 ) -> Result<(), String> {
     write_secret_file(&spec.env_file, &env_to_text(env))?;
     write_spec(spec)?;
-    for file in runner.install_files(spec, env) {
+    let files = runner.install_files(spec, env);
+    // The preflight gate: rendering is pure, so a refusal lands before
+    // any artifact is written and before the OS is asked to register
+    // anything. It sits here because install_files answers with files,
+    // not with a Result — the hook carries the verdict its signature
+    // cannot.
+    if let Some(refusal) = runner.validate(spec, env) {
+        return Err(refusal);
+    }
+    for file in files {
         write_file(&file)?;
     }
     run_all(&runner.install_cmds(spec), run)?;
@@ -403,6 +412,50 @@ mod tests {
         }
     }
 
+    /// The same fake with a refusing preflight — the shape Windows'
+    /// wrapper grammar has, where an exec word the interpreter cannot
+    /// carry is refused instead of registered.
+    struct RefusingRunner;
+    impl OsServiceRunner for RefusingRunner {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn installed(&self, spec: &ServiceSpec) -> bool {
+            FakeRunner.installed(spec)
+        }
+        fn install_files(
+            &self,
+            spec: &ServiceSpec,
+            env: &[(String, String)],
+        ) -> Vec<crate::spec::ServiceFile> {
+            FakeRunner.install_files(spec, env)
+        }
+        fn validate(&self, _spec: &ServiceSpec, _env: &[(String, String)]) -> Option<String> {
+            Some("the word carries a percent".into())
+        }
+        fn install_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.install_cmds(spec)
+        }
+        fn uninstall_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.uninstall_cmds(spec)
+        }
+        fn uninstall_files(&self, spec: &ServiceSpec) -> Vec<PathBuf> {
+            FakeRunner.uninstall_files(spec)
+        }
+        fn start_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.start_cmds(spec)
+        }
+        fn stop_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.stop_cmds(spec)
+        }
+        fn restart_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.restart_cmds(spec)
+        }
+        fn running(&self, spec: &ServiceSpec) -> bool {
+            FakeRunner.running(spec)
+        }
+    }
+
     #[test]
     fn install_writes_three_files_and_asks_the_os_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,6 +477,20 @@ mod tests {
         // unit artifact.
         assert!(spec.data_dir.join("fake.unit").is_file());
         assert_eq!(rec.seen(), vec!["fakectl enable"]);
+    }
+
+    #[test]
+    fn a_refused_preflight_fails_the_install_before_anything_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(dir.path());
+        let rec = Recorder::new();
+        let err = install_with(&RefusingRunner, &spec, &[], &mut rec.run()).unwrap_err();
+        assert!(err.contains("percent"), "{err}");
+        assert!(rec.seen().is_empty(), "the OS is never asked");
+        assert!(
+            !spec.data_dir.join("fake.unit").is_file(),
+            "the adapter's artifact is never written"
+        );
     }
 
     #[cfg(unix)]

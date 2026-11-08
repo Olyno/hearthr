@@ -18,6 +18,15 @@ pub trait OsServiceRunner: Send + Sync {
     /// The commands that finish the registration (reload, enable,
     /// bootstrap), run after the files exist. Pure.
     fn install_cmds(&self, spec: &ServiceSpec) -> Vec<Command>;
+    /// Preflight refusal on the content the install carries, for
+    /// adapters whose artifact goes through a command interpreter: an
+    /// exec word or environment pair that the interpreter cannot carry
+    /// verbatim is refused here — surfaced as an install failure before
+    /// anything is registered — instead of written into a file the shell
+    /// would reinterpret. Pure; [`None`] accepts.
+    fn validate(&self, _spec: &ServiceSpec, _env: &[(String, String)]) -> Option<String> {
+        None
+    }
     /// The commands that unregister, and the files to remove with them.
     fn uninstall_cmds(&self, spec: &ServiceSpec) -> Vec<Command>;
     fn uninstall_files(&self, spec: &ServiceSpec) -> Vec<PathBuf>;
@@ -34,7 +43,7 @@ pub trait OsServiceRunner: Send + Sync {
 
 /// The production probe behind [`detect`]: is `tool` an executable on
 /// this process's `PATH`?
-fn tool_on_path(tool: &str) -> bool {
+pub(crate) fn tool_on_path(tool: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
