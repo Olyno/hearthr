@@ -319,8 +319,26 @@ mod tests {
         );
         assert!(!files[0].secret, "the unit is not the secret");
         let unit = &files[0].contents;
-        assert!(
-            unit.contains("EnvironmentFile=/fake-home/data/launch.env"),
+        // The unit's grammar is POSIX, the host may render paths with
+        // backslashes (and the renderer then quotes/escapes them): read
+        // the value back through the same two layers and compare
+        // separator-normalized.
+        let rendered = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("EnvironmentFile="))
+            .unwrap();
+        let unquoted = rendered
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(|v| {
+                v.replace("\\\\", "\x00")
+                    .replace("\\\"", "\"")
+                    .replace('\x00', "\\")
+            })
+            .unwrap_or_else(|| rendered.to_string());
+        assert_eq!(
+            unquoted.replace('\\', "/"),
+            s.env_file.to_string_lossy().replace('\\', "/"),
             "the environment rides the 0600 file, named by path: {unit}"
         );
         assert!(
@@ -344,9 +362,31 @@ mod tests {
             unit.find("StartLimitIntervalSec").unwrap() < unit.find("[Service]").unwrap(),
             "the limits sit in [Unit], where systemd reads them"
         );
-        // The ExecStart line: the binary path and every argument, each
-        // space-bearing word quoted for systemd's parser.
-        assert!(unit.contains("/fake-home/.local/bin/mydoor --store \"/data/my vault.store\""));
+        // The ExecStart line: the binary and every argument, each
+        // space-bearing word quoted for systemd's parser. Compare
+        // through the renderer's own quoting: on a Windows host
+        // Path::join yields backslashes, which the quote layer then
+        // escapes.
+        let exec = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .unwrap();
+        let first_word = exec.split(' ').next().unwrap();
+        let unquoted = first_word
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(|v| {
+                v.replace("\\\\", "\x00")
+                    .replace("\\\"", "\"")
+                    .replace('\x00', "\\")
+            })
+            .unwrap_or_else(|| first_word.to_string());
+        assert_eq!(
+            unquoted.replace('\\', "/"),
+            s.binary.to_string_lossy().replace('\\', "/"),
+            "the binary names the unit's own program"
+        );
+        assert!(unit.contains("--store \"/data/my vault.store\""));
         assert!(unit.contains("--http 8765") && unit.contains("--allow-write"));
         assert!(
             unit.contains("--no-keystore"),
@@ -407,9 +447,25 @@ mod tests {
             .strip_prefix("ExecStart=")
             .unwrap();
         let first = exec.split(' ').next().unwrap();
+        let unquoted = first
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(|v| {
+                v.replace("\\\\", "\x00")
+                    .replace("\\\"", "\"")
+                    .replace('\x00', "\\")
+            })
+            .unwrap_or_else(|| first.to_string());
+        // Undo the doubling and the host separator; the word is then
+        // exactly the binary that went in.
+        let round = unquoted
+            .replace("$$", "$")
+            .replace("%%", "%")
+            .replace('\\', "/");
         assert_eq!(
-            first, "/fake-home/$$HOME/%%h/my%%2f$$door",
-            "no whitespace/quote/backslash, so bare — every expansion char doubled"
+            round,
+            s.binary.to_string_lossy().replace('\\', "/"),
+            "the binary rides the ExecStart word, every expansion char doubled: {exec}"
         );
         let stripped = exec.replace("%%", "").replace("$$", "");
         assert!(

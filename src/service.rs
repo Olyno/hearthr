@@ -411,6 +411,9 @@ pub(crate) fn title_case(words: &[String]) -> String {
 }
 
 /// The platform's conventional per-service home, under the slug.
+// The windows block below always returns; the fallthrough is for the
+// platforms that read env vars optionally.
+#[cfg_attr(target_os = "windows", allow(unreachable_code))]
 fn default_data_dir(slug: &str) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -449,8 +452,18 @@ fn default_data_dir(slug: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A rooted path every platform grammar calls absolute: on Windows
+    /// a leading `/` is drive-relative, so the fixture names a drive.
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{path}"))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     fn builder() -> ServiceBuilder {
-        ServiceBuilder::new("My Door").program("/usr/bin/mydoor")
+        ServiceBuilder::new("My Door").program(abs("/usr/bin/mydoor"))
     }
 
     #[test]
@@ -465,7 +478,7 @@ mod tests {
     #[test]
     fn a_single_word_slug_keeps_its_shape() {
         let service = ServiceBuilder::new("mydoor")
-            .program("/usr/local/bin/mydoor")
+            .program(abs("/usr/local/bin/mydoor"))
             .build()
             .unwrap();
         assert_eq!(service.spec().id.systemd, "mydoor.service");

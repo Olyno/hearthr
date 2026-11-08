@@ -327,8 +327,16 @@ mod tests {
             "unix extras reach the plist"
         );
         assert!(!plist.contains("--tray"));
+        // The log path is the data dir joined by the OS: a Windows host
+        // renders backslashes and the plist writer escapes nothing, so
+        // compare separator-normalized on both sides.
+        let want = spec(Path::new("/Users/me"))
+            .log_path()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let got = plist.replace('\\', "/");
         assert!(
-            plist.contains("<string>/Users/me/data/mydoor.log</string>"),
+            got.contains(&format!("<string>{}</string>", want)),
             "stderr lands in the data dir"
         );
     }
