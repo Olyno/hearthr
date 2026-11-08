@@ -5,8 +5,13 @@ edition = "2021"
 rust-version = "1.78"
 description = "Register a named background process with the OS service manager: systemd user units, launchd LaunchAgents, Windows Task Scheduler — one spec in, a kept-alive daemon out."
 license = "Apache-2.0"
-keywords = ["service", "daemon", "systemd", "launchd", "schtasks"]
+keywords = ["service", "daemon", "systemd", "launchd", "task-scheduler"]
 categories = ["os", "development-tools"]
+repository = "https://github.com/Olyno/hearthr"
+homepage = "https://github.com/Olyno/hearthr"
+documentation = "https://docs.rs/hearthr"
+readme = "README.md"
+exclude = [".github"]
 
 [dependencies]
 parking_lot = "0.12"
