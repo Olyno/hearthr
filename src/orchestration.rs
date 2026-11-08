@@ -60,7 +60,9 @@ pub fn install(spec: &ServiceSpec, env: &[(String, String)]) -> Result<ServiceSt
 }
 
 /// Uninstall: stop, unregister, and take every artifact with the
-/// launch-environment and spec files.
+/// launch-environment and spec files. The file cleanup runs even when
+/// the OS refuses to unregister — a secret never outlives its
+/// uninstall — and the refusal is what the caller hears.
 pub fn uninstall(spec: &ServiceSpec) -> Result<ServiceState, String> {
     let runner = crate::runner::runner().ok_or("no OS service runner on this machine")?;
     let _gate = lifecycle_gate();
@@ -149,13 +151,27 @@ pub(crate) fn uninstall_with(
     spec: &ServiceSpec,
     run: &mut Run<'_>,
 ) -> Result<(), String> {
-    run_all(&runner.uninstall_cmds(spec), run)?;
+    // The cleanup law: the launch environment is erased even when the OS
+    // refuses to unregister (a dead manager, a task locked by the
+    // scheduler) — a secret never outlives its uninstall. A service the
+    // OS never registered answers its own "not found" to the lenient
+    // first unregister step — the clean slate it asked for; a genuine
+    // refusal is kept and reported after the cleanup.
+    let cmd_err = run_all(&runner.uninstall_cmds(spec), run).err();
+    let mut file_err: Option<String> = None;
     for path in runner.uninstall_files(spec) {
-        remove_quiet(&path)?;
+        if let Err(e) = remove_quiet(&path) {
+            file_err.get_or_insert(e);
+        }
     }
-    remove_quiet(&spec.env_file)?;
-    remove_quiet(&spec_file(spec))?;
-    Ok(())
+    for path in [spec.env_file.clone(), spec_file(spec)] {
+        if let Err(e) = remove_quiet(&path) {
+            file_err.get_or_insert(e);
+        }
+    }
+    // Prefer the file error: a leftover secret is the worse half of a
+    // half-finished uninstall.
+    file_err.or(cmd_err).map(Err).unwrap_or(Ok(()))
 }
 
 pub(crate) fn set_running_with(
@@ -346,6 +362,47 @@ mod tests {
         }
     }
 
+    /// The same fake, unregistering strictly: the shape systemd's
+    /// `disable --now` and schtasks' `/Delete /F` have, where a refusal
+    /// is a real error and not the clean slate a lenient step answers.
+    struct StrictUninstallRunner;
+    impl OsServiceRunner for StrictUninstallRunner {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn installed(&self, spec: &ServiceSpec) -> bool {
+            FakeRunner.installed(spec)
+        }
+        fn install_files(
+            &self,
+            spec: &ServiceSpec,
+            env: &[(String, String)],
+        ) -> Vec<crate::spec::ServiceFile> {
+            FakeRunner.install_files(spec, env)
+        }
+        fn install_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.install_cmds(spec)
+        }
+        fn uninstall_cmds(&self, _spec: &ServiceSpec) -> Vec<Command> {
+            vec![Command::new("fakectl", vec!["disable".into()])]
+        }
+        fn uninstall_files(&self, spec: &ServiceSpec) -> Vec<PathBuf> {
+            FakeRunner.uninstall_files(spec)
+        }
+        fn start_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.start_cmds(spec)
+        }
+        fn stop_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.stop_cmds(spec)
+        }
+        fn restart_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
+            FakeRunner.restart_cmds(spec)
+        }
+        fn running(&self, spec: &ServiceSpec) -> bool {
+            FakeRunner.running(spec)
+        }
+    }
+
     #[test]
     fn install_writes_three_files_and_asks_the_os_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,6 +485,32 @@ mod tests {
         // NotFound-tolerant, and the answer is Ok.
         uninstall_with(&FakeRunner, &spec, &mut rec.run()).unwrap();
         assert_eq!(rec.seen(), vec!["fakectl disable"]);
+    }
+
+    #[test]
+    fn a_refused_unregister_still_takes_the_secret_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(dir.path());
+        let rec = Recorder::new();
+        install_with(
+            &FakeRunner,
+            &spec,
+            &[("TOKEN".into(), "s3cr3t".into())],
+            &mut rec.run(),
+        )
+        .unwrap();
+        let angry = Recorder::failing("disable");
+        let err = uninstall_with(&StrictUninstallRunner, &spec, &mut angry.run()).unwrap_err();
+        // The refusal is heard…
+        assert!(err.contains("fakectl disable"), "{err}");
+        // …but the launch environment is gone all the same: a secret
+        // never outlives its uninstall.
+        assert!(
+            !spec.env_file.exists(),
+            "secret survived a refused uninstall"
+        );
+        assert!(!spec_file(&spec).exists());
+        assert!(!spec.data_dir.join("fake.unit").exists());
     }
 
     #[test]

@@ -67,7 +67,9 @@
 //! are one fact. [`sync_launch_env`] re-renders the environment files with
 //! a fresh pair list and, when allowed, bounces the service — the
 //! service's version of replacing a supervised child. [`uninstall`] stops,
-//! unregisters, and takes every trace of the secret with the artifacts.
+//! unregisters, and takes every trace of the secret with the artifacts:
+//! the file cleanup happens even when the OS refuses to unregister, and
+//! the refusal is what the caller hears.
 //!
 //! Reinstall is idempotent: it overwrites the caller's own artifact and
 //! keeps everything else standing. A machine without a runner gets an
