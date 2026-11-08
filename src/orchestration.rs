@@ -53,6 +53,7 @@ pub fn installed(spec: &ServiceSpec) -> bool {
 /// overwrites this service's own artifact.
 pub fn install(spec: &ServiceSpec, env: &[(String, String)]) -> Result<ServiceState, String> {
     let runner = crate::runner::runner().ok_or("no OS service runner on this machine")?;
+    let _gate = lifecycle_gate();
     let mut exec = crate::io::exec;
     install_with(&*runner, spec, env, &mut exec)?;
     Ok(status_line(&*runner, spec, None))
@@ -62,6 +63,7 @@ pub fn install(spec: &ServiceSpec, env: &[(String, String)]) -> Result<ServiceSt
 /// launch-environment and spec files.
 pub fn uninstall(spec: &ServiceSpec) -> Result<ServiceState, String> {
     let runner = crate::runner::runner().ok_or("no OS service runner on this machine")?;
+    let _gate = lifecycle_gate();
     let mut exec = crate::io::exec;
     uninstall_with(&*runner, spec, &mut exec)?;
     Ok(status_line(&*runner, spec, Some("uninstalled".into())))
@@ -73,6 +75,7 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<ServiceState, String> {
 /// fact.
 pub fn set_running(spec: &ServiceSpec, on: bool) -> Result<ServiceState, String> {
     let runner = crate::runner::runner().ok_or("no OS service runner on this machine")?;
+    let _gate = lifecycle_gate();
     let mut exec = crate::io::exec;
     let detail = set_running_with(&*runner, spec, on, &mut exec)?;
     Ok(status_line(&*runner, spec, detail))
@@ -85,8 +88,9 @@ pub fn set_running(spec: &ServiceSpec, on: bool) -> Result<ServiceState, String>
 /// user left stopped must not start itself because a value changed; its
 /// files are refreshed either way, so its next start takes the new state.
 ///
-/// One pass at a time: a concurrent sync could recreate files an
-/// uninstall just took away (see the gate below).
+/// One pass at a time: the installed check and the write sit in the same
+/// gate, so a deferred sync can never recreate files an uninstall just
+/// took away (see [`lifecycle_gate`]).
 pub fn sync_launch_env(
     spec: &ServiceSpec,
     env: &[(String, String)],
@@ -95,13 +99,32 @@ pub fn sync_launch_env(
     let Some(runner) = crate::runner::runner() else {
         return Ok(());
     };
+    let _gate = lifecycle_gate();
     if !runner.installed(spec) {
         return Ok(()); // silent no-op: nothing is installed to sync
     }
-    let _gate = sync_gate();
     let mut exec = crate::io::exec;
     let up = restart && runner.running(spec);
     sync_with(&*runner, spec, env, up, &mut exec)
+}
+
+/// The same pass with the runner and executor injected: the gate, the
+/// installed check, and the bounce sit behind this seam so the
+/// uninstall/sync ordering is testable without an OS.
+#[cfg(test)]
+pub(crate) fn sync_checked_with(
+    runner: &dyn OsServiceRunner,
+    spec: &ServiceSpec,
+    env: &[(String, String)],
+    restart: bool,
+    run: &mut Run<'_>,
+) -> Result<(), String> {
+    let _gate = lifecycle_gate();
+    if !runner.installed(spec) {
+        return Ok(());
+    }
+    let up = restart && runner.running(spec);
+    sync_with(runner, spec, env, up, run)
 }
 
 // --- The injectable cores (test law without an OS to mutate) -------------------
@@ -187,8 +210,9 @@ fn status_line(
 }
 
 /// The one-pass-at-a-time law: without the gate a deferred sync could
-/// recreate files an uninstall had just taken away.
-fn sync_gate() -> parking_lot::MutexGuard<'static, ()> {
+/// recreate files an uninstall had just taken away, and a concurrent
+/// install could race a bounce. Every mutating lifecycle verb takes it.
+fn lifecycle_gate() -> parking_lot::MutexGuard<'static, ()> {
     static GATE: parking_lot::Mutex<()> = parking_lot::const_mutex(());
     GATE.lock()
 }
@@ -404,6 +428,42 @@ mod tests {
         // NotFound-tolerant, and the answer is Ok.
         uninstall_with(&FakeRunner, &spec, &mut rec.run()).unwrap();
         assert_eq!(rec.seen(), vec!["fakectl disable"]);
+    }
+
+    #[test]
+    fn a_sync_after_uninstall_recreates_nothing() {
+        // The vulnerable sequence: a sync that checked installed-ness
+        // before an uninstall finished used to recreate both files after
+        // the gate had been released. The check now sits inside the gate
+        // (sync_checked_with), so the post-uninstall pass is a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(dir.path());
+        let rec = Recorder::new();
+        install_with(
+            &FakeRunner,
+            &spec,
+            &[("TOKEN".into(), "x".into())],
+            &mut rec.run(),
+        )
+        .unwrap();
+        uninstall_with(&FakeRunner, &spec, &mut rec.run()).unwrap();
+        sync_checked_with(
+            &FakeRunner,
+            &spec,
+            &[("TOKEN".into(), "back".into())],
+            true,
+            &mut rec.run(),
+        )
+        .unwrap();
+        assert!(!spec.env_file.exists(), "sync resurrected the secret");
+        assert!(
+            !spec.data_dir.join("fake.unit").exists(),
+            "sync resurrected the unit"
+        );
+        assert!(
+            !rec.seen().iter().any(|c| c.contains("restart")),
+            "sync bounced a gone service"
+        );
     }
 
     #[test]
