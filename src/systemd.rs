@@ -234,47 +234,46 @@ fn unit_file(spec: &ServiceSpec) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         spec.display_name,
-        systemd_quote_value(&spec.env_file.to_string_lossy())
+        systemd_quote(&spec.env_file.to_string_lossy())
     )
 }
 
-/// Quote one ExecStart word for systemd: a space inside the word needs
-/// the whole word quoted, and `%`/`$` are systemd's own specifier and
-/// variable escapes — a literal dollar in a path must not expand at
-/// activation.
+/// Quote one ExecStart word (or a single value, e.g. an EnvironmentFile
+/// path) for systemd — two layers, in systemd's own grammar.
+///
+/// First expansion-doubling: `%`→`%%`, `$`→`$$`. These are the only
+/// spellings systemd hands through as literal percent and dollar; a
+/// backslash before them is no escape — its parser ignores it and
+/// expands the specifier/variable anyway. Doubling guards the value
+/// positions too: specifiers expand in `EnvironmentFile=` as well.
+///
+/// Then the quote layer: a word stays bare while nothing in it needs
+/// quoting (no whitespace, no `"`, no `\`); otherwise the whole word is
+/// one double-quoted token with `\`→`\\` and `"`→`\"` inside. The
+/// doubled `%`/`$` pass through that layer untouched — neither is
+/// special inside systemd quotes.
 pub(crate) fn systemd_quote(word: &str) -> String {
     if word.is_empty() {
         return "\"\"".to_string();
     }
+    let doubled = word.replace('%', "%%").replace('$', "$$");
     if !word
         .chars()
-        .any(|c| c.is_whitespace() || c == '"' || c == '%' || c == '$' || c == '\\')
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
     {
-        return word.to_string();
+        return doubled;
     }
-    let mut out = String::with_capacity(word.len() + 2);
+    let mut out = String::with_capacity(doubled.len() + 2);
     out.push('"');
-    for c in word.chars() {
+    for c in doubled.chars() {
         match c {
-            '%' | '$' | '\\' | '"' => {
-                out.push('\\');
-                out.push(c);
-            }
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
             _ => out.push(c),
         }
     }
     out.push('"');
     out
-}
-
-/// Quote a value position (not a word): EnvironmentFile paths are already
-/// one value with no separators to protect, but a stray quote or percent
-/// in a home directory must survive systemd's parser unchanged.
-fn systemd_quote_value(value: &str) -> String {
-    if !value.chars().any(|c| matches!(c, '"' | '%' | '$' | '\\')) {
-        return value.to_string();
-    }
-    systemd_quote(value)
 }
 
 #[cfg(test)]
@@ -366,14 +365,62 @@ mod tests {
     #[test]
     fn systemd_quotes_survive_the_parser() {
         // A space-bearing path is quoted as one word; a plain word stays
-        // bare; `$`/`%` are doubled-escaped so systemd never expands them
-        // at activation.
+        // bare; `$`/`%` are DOUBLED — systemd's only literal spelling —
+        // never backslash-escaped, which its parser would ignore.
         assert_eq!(systemd_quote("plain"), "plain");
         assert_eq!(systemd_quote("a b"), "\"a b\"");
         assert_eq!(systemd_quote(""), "\"\"");
-        assert_eq!(systemd_quote("/tmp/$HOME/%f"), "\"/tmp/\\$HOME/\\%f\"");
-        assert_eq!(systemd_quote_value("/plain/path"), "/plain/path");
-        assert_eq!(systemd_quote_value("/tmp/%h"), "\"/tmp/\\%h\"");
+        assert_eq!(systemd_quote("/tmp/$HOME/%f"), "/tmp/$$HOME/%%f");
+        assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn expansion_chars_are_doubled_not_backslash_escaped() {
+        // A specifier and a variable, each in a bare word: doubling is
+        // the whole of the guard; no backslash may appear.
+        assert_eq!(systemd_quote("%h"), "%%h");
+        assert_eq!(systemd_quote("$HOME"), "$$HOME");
+    }
+
+    #[test]
+    fn a_space_bearing_path_with_dollar_is_quoted_and_doubled() {
+        // Both layers at once: the word is quoted as one token and the
+        // dollar inside is doubled, passing through the quotes intact.
+        assert_eq!(systemd_quote("/opt/$HOME/my bin"), "\"/opt/$$HOME/my bin\"");
+    }
+
+    #[test]
+    fn the_unit_carries_no_expandable_specifier() {
+        // A binary path built from the very characters systemd expands:
+        // the rendered unit must show only doubled spellings, and the
+        // line stays one-token-quoted (systemd-verify-clean by content:
+        // a single ExecStart assignment, its value a valid quoted word).
+        let home = Path::new("/fake-home");
+        let runner = SystemdUserRunner::at(home);
+        let mut s = spec(home);
+        s.binary = home.join("$HOME/%h/my%2f$door");
+        let unit = runner.install_files(&s, &[])[0].contents.clone();
+        let exec = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap()
+            .strip_prefix("ExecStart=")
+            .unwrap();
+        let first = exec.split(' ').next().unwrap();
+        assert_eq!(
+            first, "/fake-home/$$HOME/%%h/my%%2f$$door",
+            "no whitespace/quote/backslash, so bare — every expansion char doubled"
+        );
+        let stripped = exec.replace("%%", "").replace("$$", "");
+        assert!(
+            !stripped.contains('%') && !stripped.contains('$'),
+            "no single % or $ survives anywhere on the line: {exec}"
+        );
+        assert_eq!(
+            unit.lines().filter(|l| l.starts_with("ExecStart=")).count(),
+            1,
+            "one ExecStart assignment — the value is a single valid token line"
+        );
     }
 
     #[test]
