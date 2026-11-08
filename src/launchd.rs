@@ -126,14 +126,24 @@ impl OsServiceRunner for LaunchAgentRunner {
     }
 
     fn start_cmds(&self, spec: &ServiceSpec) -> Vec<Command> {
-        // A stop bootout can leave the label flagged disabled, and a
-        // disabled label kickstarts to nothing. enable is strict here for
-        // the same reason install_cmds treats it strictly: the start was
-        // not delivered if the label cannot run. kickstart then starts
-        // the loaded job (KeepAlive, not RunAtLoad, is what keeps it up).
+        // The stop booted the job out, so a start must load it again:
+        // enable clears the `disabled` flag a bootout can leave behind,
+        // and bootstrap re-registers the plist — RunAtLoad starts it at
+        // once, which is the same enable-and-start an install delivers.
+        // kickstart cannot stand in: it acts on a loaded job, and the
+        // whole point of a stop was to unload it. A start of a service
+        // that was already up answers bootstrap's "already exists",
+        // the OS's true words for that no-op.
         vec![
             Command::new("launchctl", vec!["enable".into(), self.job(spec)]),
-            Command::new("launchctl", vec!["kickstart".into(), self.job(spec)]),
+            Command::new(
+                "launchctl",
+                vec![
+                    "bootstrap".into(),
+                    self.target(),
+                    self.plist_path(spec).display().to_string(),
+                ],
+            ),
         ]
     }
 
@@ -392,9 +402,11 @@ mod tests {
             !start[0].lenient,
             "a label that cannot run means the start was not delivered"
         );
-        assert_eq!(
-            start[1].args,
-            vec!["kickstart", "gui/501/com.example.mydoor"]
+        assert_eq!(start[1].args[0], "bootstrap");
+        assert_eq!(start[1].args[1], "gui/501");
+        assert!(
+            start[1].args[2].ends_with("com.example.mydoor.plist"),
+            "a stop booted the job out; a start re-bootstraps the plist"
         );
         assert!(!start[1].lenient);
         let restart = runner.restart_cmds(&s);
